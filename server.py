@@ -21,7 +21,7 @@ import threading
 import json
 
 HOST = "0.0.0.0"   # aceita ligacoes de qualquer IP na rede
-PORT = 5555
+PORT = 8080
 
 # Guarda o estado de cada jogador ligado: { id_jogador: {"x":.., "y":.., "conn": socket} }
 jogadores = {}
