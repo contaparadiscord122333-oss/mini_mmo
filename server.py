@@ -58,6 +58,8 @@ def transmitir_estado():
 def tratar_cliente(conn, addr):
     global proximo_id
 
+    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
     with lock:
         meu_id = proximo_id
         proximo_id += 1
