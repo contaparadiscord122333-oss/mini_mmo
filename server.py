@@ -21,40 +21,12 @@ import threading
 import json
 
 HOST = "0.0.0.0"   # aceita ligacoes de qualquer IP na rede
-PORT = 8080
+PORT = 5555
 
 # Guarda o estado de cada jogador ligado: { id_jogador: {"x":.., "y":.., "conn": socket} }
 jogadores = {}
 lock = threading.Lock()   # protege o dicionario 'jogadores' contra acessos em simultaneo
 proximo_id = 1
-
-# --- NPCs ---
-# Por agora sao estaticos (posicao fixa, nao se mexem). Cada um tem uma lista
-# de falas que o cliente mostra por ordem, uma de cada vez, quando o jogador
-# carrega em E perto dele.
-NPCS = [
-    {
-        "id": 1,
-        "nome": "Velho Sabio",
-        "x": 300,
-        "y": 200,
-        "falas": [
-            "Ah, um viajante! Bem-vindo a aldeia.",
-            "Ouvi dizer que ha monstros a espreitar para la do portal.",
-            "Se fores ate ao portal a norte, talvez encontres uma missao para ti.",
-        ],
-    },
-    {
-        "id": 2,
-        "nome": "Guarda",
-        "x": 650,
-        "y": 400,
-        "falas": [
-            "Mantem-te alerta, isto nem sempre foi seguro.",
-            "Se precisares de equipamento, fala com o ferreiro.",
-        ],
-    },
-]
 
 
 def enviar(conn, dados: dict):
@@ -67,16 +39,23 @@ def enviar(conn, dados: dict):
 
 
 def transmitir_estado():
-    """Manda o estado de todos os jogadores para todos os jogadores."""
+    """
+    Manda o estado dos jogadores para todos os jogadores, mas cada um so
+    recebe os jogadores que estao no MESMO mapa que ele (senao verias gente
+    "invisivel" ligada mas noutra sala).
+    """
     with lock:
-        estado = {
-            "tipo": "estado",
-            "jogadores": {
-                str(pid): {"x": info["x"], "y": info["y"]}
-                for pid, info in jogadores.items()
-            },
-        }
+        # agrupa jogadores por mapa, uma vez, para nao repetir trabalho por cada envio
+        por_mapa = {}
+        for pid, info in jogadores.items():
+            por_mapa.setdefault(info["mapa"], {})[str(pid)] = {"x": info["x"], "y": info["y"]}
+
         for info in jogadores.values():
+            estado = {
+                "tipo": "estado",
+                "mapa": info["mapa"],
+                "jogadores": por_mapa.get(info["mapa"], {}),
+            }
             enviar(info["conn"], estado)
 
 
@@ -86,14 +65,12 @@ def tratar_cliente(conn, addr):
     with lock:
         meu_id = proximo_id
         proximo_id += 1
-        jogadores[meu_id] = {"x": 100, "y": 100, "conn": conn}
+        jogadores[meu_id] = {"x": 100, "y": 100, "mapa": "arena", "conn": conn}
 
     print(f"[+] Jogador {meu_id} ligou-se de {addr}")
 
     # diz ao cliente qual e o id dele
     enviar(conn, {"tipo": "bem_vindo", "id": meu_id})
-    # manda a lista de NPCs (sao estaticos, so precisa de ser mandada uma vez)
-    enviar(conn, {"tipo": "npcs", "npcs": NPCS})
     transmitir_estado()
 
     buffer = ""
@@ -114,6 +91,16 @@ def tratar_cliente(conn, addr):
                 if msg.get("tipo") == "mover":
                     with lock:
                         if meu_id in jogadores:
+                            jogadores[meu_id]["x"] = msg["x"]
+                            jogadores[meu_id]["y"] = msg["y"]
+                    transmitir_estado()
+
+                elif msg.get("tipo") == "mudar_mapa":
+                    # o jogador atravessou um portal: muda de mapa e reaparece
+                    # na posicao de spawn que o cliente indicou
+                    with lock:
+                        if meu_id in jogadores:
+                            jogadores[meu_id]["mapa"] = msg["mapa"]
                             jogadores[meu_id]["x"] = msg["x"]
                             jogadores[meu_id]["y"] = msg["y"]
                     transmitir_estado()
