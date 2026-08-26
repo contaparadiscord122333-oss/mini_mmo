@@ -19,11 +19,54 @@ Render, etc) - por agora o objetivo e teres a logica de rede a funcionar.
 import socket
 import threading
 import json
+import os
 
 HOST = "0.0.0.0"   # aceita ligacoes de qualquer IP na rede
-PORT = 8080
+# Servicos como Railway atribuem a porta automaticamente pela variavel PORT.
+PORT = int(os.environ.get("PORT", 8080))
 
-# Guarda o estado de cada jogador ligado: { id_jogador: {"x":.., "y":.., "conn": socket} }
+MOEDAS_INICIAIS = 100
+
+# NPCs fixos, organizados por mapa. Cada jogador so recebe os NPCs do mapa
+# onde esta - por isso reenviamos esta lista sempre que o jogador muda de
+# mapa, e nao so uma vez ao ligar.
+NPCS_POR_MAPA = {
+    "arena": [
+        {
+            "id": "guarda_1",
+            "nome": "Guarda da Arena",
+            "x": 300, "y": 230,
+            "falas": [
+                "Alto la! Isto e a Arena Central.",
+                "So os corajosos se atrevem a entrar.",
+                "Ha uma missao a leste, se procuras aventura.",
+            ],
+        },
+        {
+            "id": "guarda_2",
+            "nome": "Guarda da Arena",
+            "x": 660, "y": 230,
+            "falas": [
+                "Esta arena ja viu muitas batalhas.",
+                "Cuidado com as poças de agua, dizem que trazem azar.",
+            ],
+        },
+    ],
+    "missao1": [
+        {
+            "id": "ferreiro",
+            "nome": "Ferreiro",
+            "x": 150, "y": 200,
+            "falas": [
+                "Bem-vindo a minha forja, aventureiro.",
+                "Ainda nao tenho armas para vender - isso vem na proxima etapa.",
+            ],
+        },
+    ],
+}
+
+# Guarda o estado de cada jogador ligado:
+# { id_jogador: {"x":.., "y":.., "mapa":.., "moedas":.., "conn": socket} }
 jogadores = {}
 lock = threading.Lock()   # protege o dicionario 'jogadores' contra acessos em simultaneo
 proximo_id = 1
@@ -62,15 +105,22 @@ def transmitir_estado():
 def tratar_cliente(conn, addr):
     global proximo_id
 
+    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
     with lock:
         meu_id = proximo_id
         proximo_id += 1
-        jogadores[meu_id] = {"x": 100, "y": 100, "mapa": "arena", "conn": conn}
+        jogadores[meu_id] = {
+            "x": 100, "y": 100, "mapa": "arena",
+            "moedas": MOEDAS_INICIAIS, "conn": conn,
+        }
 
     print(f"[+] Jogador {meu_id} ligou-se de {addr}")
 
-    # diz ao cliente qual e o id dele
-    enviar(conn, {"tipo": "bem_vindo", "id": meu_id})
+    # diz ao cliente qual e o id dele e quantas moedas tem
+    enviar(conn, {"tipo": "bem_vindo", "id": meu_id, "moedas": MOEDAS_INICIAIS})
+    # manda os NPCs do mapa onde comeca (arena)
+    enviar(conn, {"tipo": "npcs", "npcs": NPCS_POR_MAPA.get("arena", [])})
     transmitir_estado()
 
     buffer = ""
@@ -98,11 +148,14 @@ def tratar_cliente(conn, addr):
                 elif msg.get("tipo") == "mudar_mapa":
                     # o jogador atravessou um portal: muda de mapa e reaparece
                     # na posicao de spawn que o cliente indicou
+                    novo_mapa = msg["mapa"]
                     with lock:
                         if meu_id in jogadores:
-                            jogadores[meu_id]["mapa"] = msg["mapa"]
+                            jogadores[meu_id]["mapa"] = novo_mapa
                             jogadores[meu_id]["x"] = msg["x"]
                             jogadores[meu_id]["y"] = msg["y"]
+                    # manda os NPCs do mapa novo (cada mapa tem os seus)
+                    enviar(conn, {"tipo": "npcs", "npcs": NPCS_POR_MAPA.get(novo_mapa, [])})
                     transmitir_estado()
 
     except (ConnectionResetError, json.JSONDecodeError):
