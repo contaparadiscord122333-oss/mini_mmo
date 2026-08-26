@@ -1,0 +1,3 @@
+# O server.py so usa a biblioteca padrao do Python (socket, threading, json)
+# por isso nao ha dependencias externas para o SERVIDOR.
+# (o client.py precisa de pygame, mas isso corre no PC de cada jogador, nao na cloud)
