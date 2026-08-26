@@ -19,17 +19,42 @@ Render, etc) - por agora o objetivo e teres a logica de rede a funcionar.
 import socket
 import threading
 import json
-import os
 
-HOST = "0.0.0.0"   # aceita ligacoes de qualquer IP (necessario para a cloud)
-# Servicos como Railway atribuem a porta automaticamente pela variavel PORT.
-# Localmente, se essa variavel nao existir, usa-se 5555 por omissao.
-PORT = int(os.environ.get("PORT", 5555))
+HOST = "0.0.0.0"   # aceita ligacoes de qualquer IP na rede
+PORT = 5555
 
 # Guarda o estado de cada jogador ligado: { id_jogador: {"x":.., "y":.., "conn": socket} }
 jogadores = {}
 lock = threading.Lock()   # protege o dicionario 'jogadores' contra acessos em simultaneo
 proximo_id = 1
+
+# --- NPCs ---
+# Por agora sao estaticos (posicao fixa, nao se mexem). Cada um tem uma lista
+# de falas que o cliente mostra por ordem, uma de cada vez, quando o jogador
+# carrega em E perto dele.
+NPCS = [
+    {
+        "id": 1,
+        "nome": "Velho Sabio",
+        "x": 300,
+        "y": 200,
+        "falas": [
+            "Ah, um viajante! Bem-vindo a aldeia.",
+            "Ouvi dizer que ha monstros a espreitar para la do portal.",
+            "Se fores ate ao portal a norte, talvez encontres uma missao para ti.",
+        ],
+    },
+    {
+        "id": 2,
+        "nome": "Guarda",
+        "x": 650,
+        "y": 400,
+        "falas": [
+            "Mantem-te alerta, isto nem sempre foi seguro.",
+            "Se precisares de equipamento, fala com o ferreiro.",
+        ],
+    },
+]
 
 
 def enviar(conn, dados: dict):
@@ -58,8 +83,6 @@ def transmitir_estado():
 def tratar_cliente(conn, addr):
     global proximo_id
 
-    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
     with lock:
         meu_id = proximo_id
         proximo_id += 1
@@ -69,6 +92,8 @@ def tratar_cliente(conn, addr):
 
     # diz ao cliente qual e o id dele
     enviar(conn, {"tipo": "bem_vindo", "id": meu_id})
+    # manda a lista de NPCs (sao estaticos, so precisa de ser mandada uma vez)
+    enviar(conn, {"tipo": "npcs", "npcs": NPCS})
     transmitir_estado()
 
     buffer = ""
