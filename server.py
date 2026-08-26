@@ -51,19 +51,36 @@ NPCS_POR_MAPA = {
                 "Cuidado com as poças de agua, dizem que trazem azar.",
             ],
         },
-    ],
-    "missao1": [
         {
             "id": "ferreiro",
             "nome": "Ferreiro",
-            "x": 150, "y": 200,
-            "falas": [
-                "Bem-vindo a minha forja, aventureiro.",
-                "Ainda nao tenho armas para vender - isso vem na proxima etapa.",
+            "x": 110, "y": 430,
+            # NPCs com "loja" nao usam dialogo normal: ao falares com eles
+            # o cliente abre diretamente a interface de compra (ver "itens").
+            "loja": True,
+            "falas": [],
+            "itens": [
+                {"id": "espada_curta", "nome": "Espada Curta", "preco": 15},
+                {"id": "espada_longa", "nome": "Espada Longa", "preco": 35},
+                {"id": "espada_de_aco", "nome": "Espada de Aco", "preco": 60},
+                {"id": "espada_flamejante", "nome": "Espada Flamejante", "preco": 120},
             ],
         },
     ],
+    "missao1": [],
 }
+
+
+def encontrar_item_loja(npc_id, item_id):
+    """Procura, em qualquer mapa, um NPC-loja com este id e devolve o item
+    pedido (dict) ou None se o NPC/item nao existir ou o NPC nao for loja."""
+    for lista_npcs in NPCS_POR_MAPA.values():
+        for npc in lista_npcs:
+            if npc["id"] == npc_id and npc.get("loja"):
+                for item in npc["itens"]:
+                    if item["id"] == item_id:
+                        return item
+    return None
 
 # Guarda o estado de cada jogador ligado:
 # { id_jogador: {"x":.., "y":.., "mapa":.., "moedas":.., "conn": socket} }
@@ -113,6 +130,7 @@ def tratar_cliente(conn, addr):
         jogadores[meu_id] = {
             "x": 100, "y": 100, "mapa": "arena",
             "moedas": MOEDAS_INICIAIS, "conn": conn,
+            "inventario": [],
         }
 
     print(f"[+] Jogador {meu_id} ligou-se de {addr}")
@@ -157,6 +175,32 @@ def tratar_cliente(conn, addr):
                     # manda os NPCs do mapa novo (cada mapa tem os seus)
                     enviar(conn, {"tipo": "npcs", "npcs": NPCS_POR_MAPA.get(novo_mapa, [])})
                     transmitir_estado()
+
+                elif msg.get("tipo") == "comprar":
+                    # o jogador tentou comprar um item na loja de um NPC
+                    npc_id = msg.get("npc_id")
+                    item_id = msg.get("item_id")
+                    item = encontrar_item_loja(npc_id, item_id)
+
+                    resposta = {"tipo": "compra_resultado", "item_id": item_id}
+                    if item is None:
+                        resposta["sucesso"] = False
+                        resposta["mensagem"] = "Esse item ja nao existe."
+                    else:
+                        with lock:
+                            info = jogadores.get(meu_id)
+                            if info is None:
+                                continue
+                            if info["moedas"] >= item["preco"]:
+                                info["moedas"] -= item["preco"]
+                                info["inventario"].append(item_id)
+                                resposta["sucesso"] = True
+                                resposta["mensagem"] = f"Compraste: {item['nome']}!"
+                                resposta["moedas"] = info["moedas"]
+                            else:
+                                resposta["sucesso"] = False
+                                resposta["mensagem"] = "Moedas insuficientes."
+                    enviar(conn, resposta)
 
     except (ConnectionResetError, json.JSONDecodeError):
         pass
