@@ -1,35 +1,50 @@
 """
-SERVIDOR - versao 1 (rede local)
---------------------------------
-O que faz:
-- Aceita varios jogadores a ligarem-se por TCP
-- Cada jogador manda a sua posicao (x, y)
-- O servidor reenvia a posicao de TODOS os jogadores para TODOS os jogadores
-- Deteta quando um jogador desliga e remove-o
+SERVIDOR - versao 3 (monstros + combate basico + inventario)
+--------------------------------------------------------------
+Novidades desta etapa em relacao a etapa 2:
+- Monstros: cada mapa pode ter uma lista de monstros, com vida propria e
+  movimento de patrulha simples (andam de um lado para o outro). O servidor
+  e' o "juiz": e' ele que sabe a posicao/vida real de cada monstro, e manda
+  isso aos clientes para eles so desenharem.
+- Combate: o cliente pede para atacar um monstro (tipo "atacar"). O servidor
+  confirma que o jogador esta perto o suficiente e nao atacou ha pouco tempo
+  (cooldown), e so ai aplica dano. Isto evita batota (um cliente modificado
+  nao pode simplesmente dizer "matei o monstro").
+- Contacto com monstros: se um jogador tocar num monstro, leva dano (com
+  cooldown tambem). Se a vida chegar a 0, o jogador "renasce" no spawn do
+  mapa com a vida cheia.
+- Inventario: continua a viver no servidor (lista de ids de itens). Agora
+  tambem guardamos qual a arma equipada, que define o dano de ataque.
 
 Como correr:
     python server.py
-
-Isto corre na tua maquina. Para os amigos testarem na MESMA rede (wifi de
-casa), eles ligam-se ao teu IP local (ex: 192.168.1.50). Para testarem pela
-INTERNET, mais tarde vamos publicar isto num servidor na nuvem (Railway,
-Render, etc) - por agora o objetivo e teres a logica de rede a funcionar.
 """
 
 import socket
 import threading
 import json
 import os
+import time
+import math
 
-HOST = "0.0.0.0"   # aceita ligacoes de qualquer IP na rede
-# Servicos como Railway atribuem a porta automaticamente pela variavel PORT.
+HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", 8080))
 
 MOEDAS_INICIAIS = 100
+VIDA_INICIAL = 100
 
-# NPCs fixos, organizados por mapa. Cada jogador so recebe os NPCs do mapa
-# onde esta - por isso reenviamos esta lista sempre que o jogador muda de
-# mapa, e nao so uma vez ao ligar.
+# --- Catalogo de armas --------------------------------------------------
+# Cada arma vendida nas lojas tem aqui o dano que da' quando equipada.
+# Sem nenhuma arma equipada, o jogador ataca aos "punhos" (dano baixo).
+DANO_PUNHOS = 4
+ARMAS = {
+    "espada_curta": {"nome": "Espada Curta", "dano": 10},
+    "espada_longa": {"nome": "Espada Longa", "dano": 16},
+    "espada_de_aco": {"nome": "Espada de Aco", "dano": 24},
+    "espada_flamejante": {"nome": "Espada Flamejante", "dano": 38},
+}
+
+# NPCs fixos, organizados por mapa.
 NPCS_POR_MAPA = {
     "arena": [
         {
@@ -55,8 +70,6 @@ NPCS_POR_MAPA = {
             "id": "ferreiro",
             "nome": "Ferreiro",
             "x": 110, "y": 430,
-            # NPCs com "loja" nao usam dialogo normal: ao falares com eles
-            # o cliente abre diretamente a interface de compra (ver "itens").
             "loja": True,
             "falas": [],
             "itens": [
@@ -70,10 +83,59 @@ NPCS_POR_MAPA = {
     "missao1": [],
 }
 
+# Ponto de "renascimento" de cada mapa, para quando um jogador morre.
+MAPA_SPAWN = {
+    "arena": (100, 100),
+    "missao1": (60, 270),
+}
+
+# --- Monstros ------------------------------------------------------------
+# "patrulha" = quantos pixeis para cada lado do ponto inicial o monstro
+# anda (0 = fica parado no sitio). Isto e' apenas o "molde"; o estado real
+# (vida atual, se esta vivo, posicao atual) vive em MONSTROS_ESTADO.
+MONSTROS_POR_MAPA = {
+    "arena": [],
+    "missao1": [
+        {"id": "slime_1", "tipo": "slime", "x": 250, "y": 150, "vida_max": 30, "dano": 6, "moedas": 5, "patrulha": 50},
+        {"id": "slime_2", "tipo": "slime", "x": 420, "y": 380, "vida_max": 30, "dano": 6, "moedas": 5, "patrulha": 50},
+        {"id": "morcego_1", "tipo": "morcego", "x": 550, "y": 220, "vida_max": 18, "dano": 4, "moedas": 3, "patrulha": 0},
+        {"id": "orc_1", "tipo": "orc", "x": 700, "y": 300, "vida_max": 60, "dano": 12, "moedas": 15, "patrulha": 70},
+    ],
+}
+
+VELOCIDADE_MONSTRO = 1.4        # pixeis por "tick" do loop de monstros
+INTERVALO_TICK = 0.15           # segundos entre atualizacoes de monstros
+RESPAWN_MONSTRO_SEG = 15.0      # quanto tempo ate um monstro morto reaparecer
+ALCANCE_ATAQUE = 70             # distancia maxima para o ataque do jogador acertar
+COOLDOWN_ATAQUE = 0.45          # segundos minimos entre ataques do jogador
+RAIO_CONTATO = 26               # distancia para um monstro "tocar" no jogador
+COOLDOWN_DANO_CONTATO = 0.9     # segundos minimos entre dois danos de contacto
+
+
+def construir_monstros_estado():
+    """Cria o dicionario de estado (runtime) de todos os monstros, a partir
+    dos moldes acima. Cada monstro passa a ter: posicao atual, vida atual,
+    se esta vivo, e dados para a patrulha (direcao e limites)."""
+    estado = {}
+    for mapa, lista in MONSTROS_POR_MAPA.items():
+        estado[mapa] = {}
+        for molde in lista:
+            estado[mapa][molde["id"]] = {
+                **molde,
+                "vida": molde["vida_max"],
+                "vivo": True,
+                "spawn_x": molde["x"],
+                "spawn_y": molde["y"],
+                "dir": 1,
+                "hora_morte": None,
+            }
+    return estado
+
+
+MONSTROS_ESTADO = construir_monstros_estado()
+
 
 def encontrar_item_loja(npc_id, item_id):
-    """Procura, em qualquer mapa, um NPC-loja com este id e devolve o item
-    pedido (dict) ou None se o NPC/item nao existir ou o NPC nao for loja."""
     for lista_npcs in NPCS_POR_MAPA.values():
         for npc in lista_npcs:
             if npc["id"] == npc_id and npc.get("loja"):
@@ -82,15 +144,24 @@ def encontrar_item_loja(npc_id, item_id):
                         return item
     return None
 
-# Guarda o estado de cada jogador ligado:
-# { id_jogador: {"x":.., "y":.., "mapa":.., "moedas":.., "conn": socket} }
+
+def info_inventario(info):
+    """Monta a lista de itens do inventario (com nome e dano) para mandar
+    ao cliente, mais qual esta equipada neste momento."""
+    itens = []
+    for item_id in info["inventario"]:
+        arma = ARMAS.get(item_id, {"nome": item_id, "dano": 0})
+        itens.append({"id": item_id, "nome": arma["nome"], "dano": arma["dano"]})
+    return {"tipo": "inventario", "itens": itens, "equipada": info["arma_equipada"]}
+
+
+# Guarda o estado de cada jogador ligado
 jogadores = {}
-lock = threading.Lock()   # protege o dicionario 'jogadores' contra acessos em simultaneo
+lock = threading.Lock()
 proximo_id = 1
 
 
 def enviar(conn, dados: dict):
-    """Envia um dicionario como JSON, terminado por \\n (para saber onde acaba a mensagem)."""
     try:
         msg = (json.dumps(dados) + "\n").encode("utf-8")
         conn.sendall(msg)
@@ -100,23 +171,86 @@ def enviar(conn, dados: dict):
 
 def transmitir_estado():
     """
-    Manda o estado dos jogadores para todos os jogadores, mas cada um so
-    recebe os jogadores que estao no MESMO mapa que ele (senao verias gente
-    "invisivel" ligada mas noutra sala).
+    Manda a cada jogador: os outros jogadores do mesmo mapa, os monstros
+    vivos do mesmo mapa, e o seu proprio estado pessoal (vida/moedas), que
+    so ele precisa de saber.
     """
     with lock:
-        # agrupa jogadores por mapa, uma vez, para nao repetir trabalho por cada envio
         por_mapa = {}
         for pid, info in jogadores.items():
             por_mapa.setdefault(info["mapa"], {})[str(pid)] = {"x": info["x"], "y": info["y"]}
 
-        for info in jogadores.values():
+        monstros_por_mapa_vivos = {}
+        for mapa, monstros in MONSTROS_ESTADO.items():
+            monstros_por_mapa_vivos[mapa] = {
+                mid: {"x": m["x"], "y": m["y"], "tipo": m["tipo"], "vida": m["vida"], "vida_max": m["vida_max"]}
+                for mid, m in monstros.items() if m["vivo"]
+            }
+
+        for pid, info in jogadores.items():
             estado = {
                 "tipo": "estado",
                 "mapa": info["mapa"],
                 "jogadores": por_mapa.get(info["mapa"], {}),
+                "monstros": monstros_por_mapa_vivos.get(info["mapa"], {}),
+                "eu": {"vida": info["vida"], "vida_max": info["vida_max"], "moedas": info["moedas"]},
             }
             enviar(info["conn"], estado)
+
+
+def loop_monstros():
+    """
+    Corre para sempre numa thread separada:
+    - move os monstros que tem patrulha (andam de um lado para o outro)
+    - faz "respawn" dos que ja estao mortos ha tempo suficiente
+    - aplica dano de contacto a jogadores que estejam em cima de um monstro
+    - transmite o novo estado a todos
+    """
+    while True:
+        time.sleep(INTERVALO_TICK)
+        agora = time.time()
+        houve_mudanca = False
+
+        with lock:
+            for mapa, monstros in MONSTROS_ESTADO.items():
+                for m in monstros.values():
+                    if not m["vivo"]:
+                        if m["hora_morte"] is not None and (agora - m["hora_morte"]) >= RESPAWN_MONSTRO_SEG:
+                            m["vivo"] = True
+                            m["vida"] = m["vida_max"]
+                            m["x"], m["y"] = m["spawn_x"], m["spawn_y"]
+                            m["hora_morte"] = None
+                            houve_mudanca = True
+                        continue
+
+                    # patrulha simples: anda para um lado ate ao limite, depois inverte
+                    if m["patrulha"] > 0:
+                        m["x"] += VELOCIDADE_MONSTRO * m["dir"]
+                        if m["x"] >= m["spawn_x"] + m["patrulha"]:
+                            m["dir"] = -1
+                        elif m["x"] <= m["spawn_x"] - m["patrulha"]:
+                            m["dir"] = 1
+                        houve_mudanca = True
+
+                    # dano de contacto a jogadores do mesmo mapa
+                    for info in jogadores.values():
+                        if info["mapa"] != mapa:
+                            continue
+                        dist = math.hypot(info["x"] - m["x"], info["y"] - m["y"])
+                        if dist < RAIO_CONTATO and (agora - info.get("ultimo_dano", 0)) >= COOLDOWN_DANO_CONTATO:
+                            info["ultimo_dano"] = agora
+                            info["vida"] -= m["dano"]
+                            houve_mudanca = True
+                            if info["vida"] <= 0:
+                                info["vida"] = info["vida_max"]
+                                spawn = MAPA_SPAWN.get(info["mapa"], (100, 100))
+                                info["x"], info["y"] = spawn
+                                enviar(info["conn"], {
+                                    "tipo": "respawn", "x": spawn[0], "y": spawn[1], "vida": info["vida"],
+                                })
+
+        if houve_mudanca:
+            transmitir_estado()
 
 
 def tratar_cliente(conn, addr):
@@ -130,15 +264,23 @@ def tratar_cliente(conn, addr):
         jogadores[meu_id] = {
             "x": 100, "y": 100, "mapa": "arena",
             "moedas": MOEDAS_INICIAIS, "conn": conn,
-            "inventario": [],
+            # Todo o jogador comeca ja com a Espada Curta (a espada que
+            # "apanha" na tela de introducao do cliente), em vez de comecar
+            # aos punhos. Continua a poder trocar de arma na loja/inventario
+            # como antes.
+            "inventario": ["espada_curta"],
+            "arma_equipada": "espada_curta",
+            "vida": VIDA_INICIAL, "vida_max": VIDA_INICIAL,
+            "ultimo_ataque": 0.0,
+            "ultimo_dano": 0.0,
         }
+        info_local = jogadores[meu_id]
 
     print(f"[+] Jogador {meu_id} ligou-se de {addr}")
 
-    # diz ao cliente qual e o id dele e quantas moedas tem
-    enviar(conn, {"tipo": "bem_vindo", "id": meu_id, "moedas": MOEDAS_INICIAIS})
-    # manda os NPCs do mapa onde comeca (arena)
+    enviar(conn, {"tipo": "bem_vindo", "id": meu_id, "moedas": MOEDAS_INICIAIS, "vida": VIDA_INICIAL})
     enviar(conn, {"tipo": "npcs", "npcs": NPCS_POR_MAPA.get("arena", [])})
+    enviar(conn, info_inventario(info_local))
     transmitir_estado()
 
     buffer = ""
@@ -146,38 +288,34 @@ def tratar_cliente(conn, addr):
         while True:
             dados = conn.recv(1024)
             if not dados:
-                break  # cliente desligou
+                break
 
             buffer += dados.decode("utf-8")
-            # pode chegar mais que uma mensagem de cada vez, ou uma mensagem partida
             while "\n" in buffer:
                 linha, buffer = buffer.split("\n", 1)
                 if not linha.strip():
                     continue
                 msg = json.loads(linha)
+                tipo = msg.get("tipo")
 
-                if msg.get("tipo") == "mover":
+                if tipo == "mover":
                     with lock:
                         if meu_id in jogadores:
                             jogadores[meu_id]["x"] = msg["x"]
                             jogadores[meu_id]["y"] = msg["y"]
                     transmitir_estado()
 
-                elif msg.get("tipo") == "mudar_mapa":
-                    # o jogador atravessou um portal: muda de mapa e reaparece
-                    # na posicao de spawn que o cliente indicou
+                elif tipo == "mudar_mapa":
                     novo_mapa = msg["mapa"]
                     with lock:
                         if meu_id in jogadores:
                             jogadores[meu_id]["mapa"] = novo_mapa
                             jogadores[meu_id]["x"] = msg["x"]
                             jogadores[meu_id]["y"] = msg["y"]
-                    # manda os NPCs do mapa novo (cada mapa tem os seus)
                     enviar(conn, {"tipo": "npcs", "npcs": NPCS_POR_MAPA.get(novo_mapa, [])})
                     transmitir_estado()
 
-                elif msg.get("tipo") == "comprar":
-                    # o jogador tentou comprar um item na loja de um NPC
+                elif tipo == "comprar":
                     npc_id = msg.get("npc_id")
                     item_id = msg.get("item_id")
                     item = encontrar_item_loja(npc_id, item_id)
@@ -186,6 +324,7 @@ def tratar_cliente(conn, addr):
                     if item is None:
                         resposta["sucesso"] = False
                         resposta["mensagem"] = "Esse item ja nao existe."
+                        enviar(conn, resposta)
                     else:
                         with lock:
                             info = jogadores.get(meu_id)
@@ -200,7 +339,59 @@ def tratar_cliente(conn, addr):
                             else:
                                 resposta["sucesso"] = False
                                 resposta["mensagem"] = "Moedas insuficientes."
-                    enviar(conn, resposta)
+                            enviar(conn, resposta)
+                            if resposta["sucesso"]:
+                                enviar(conn, info_inventario(info))
+
+                elif tipo == "equipar":
+                    item_id = msg.get("item_id")
+                    with lock:
+                        info = jogadores.get(meu_id)
+                        if info is None:
+                            continue
+                        # None = "desequipar" (voltar a lutar aos punhos)
+                        if item_id is None or item_id in info["inventario"]:
+                            info["arma_equipada"] = item_id
+                            enviar(conn, info_inventario(info))
+
+                elif tipo == "atacar":
+                    monstro_id = msg.get("monstro_id")
+                    agora = time.time()
+                    with lock:
+                        info = jogadores.get(meu_id)
+                        if info is None:
+                            continue
+                        monstro = MONSTROS_ESTADO.get(info["mapa"], {}).get(monstro_id)
+
+                        pode_atacar = (
+                            monstro is not None and monstro["vivo"]
+                            and (agora - info["ultimo_ataque"]) >= COOLDOWN_ATAQUE
+                        )
+                        if pode_atacar:
+                            dist = math.hypot(info["x"] - monstro["x"], info["y"] - monstro["y"])
+                            pode_atacar = dist <= ALCANCE_ATAQUE
+
+                        if pode_atacar:
+                            info["ultimo_ataque"] = agora
+                            arma = ARMAS.get(info["arma_equipada"])
+                            dano = arma["dano"] if arma else DANO_PUNHOS
+                            monstro["vida"] -= dano
+
+                            morreu = monstro["vida"] <= 0
+                            if morreu:
+                                monstro["vivo"] = False
+                                monstro["vida"] = 0
+                                monstro["hora_morte"] = agora
+                                info["moedas"] += monstro["moedas"]
+
+                            enviar(conn, {
+                                "tipo": "acerto",
+                                "monstro_id": monstro_id,
+                                "dano": dano,
+                                "morreu": morreu,
+                                "moedas": info["moedas"],
+                            })
+                    transmitir_estado()
 
     except (ConnectionResetError, json.JSONDecodeError):
         pass
@@ -218,6 +409,8 @@ def main():
     servidor.bind((HOST, PORT))
     servidor.listen()
     print(f"Servidor a correr em {HOST}:{PORT} (ctrl+C para parar)")
+
+    threading.Thread(target=loop_monstros, daemon=True).start()
 
     try:
         while True:
