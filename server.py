@@ -44,6 +44,55 @@ ARMAS = {
     "espada_flamejante": {"nome": "Espada Flamejante", "dano": 38},
 }
 
+# --- Catalogo de armaduras ------------------------------------------------
+# "defesa" e' quanto reduz do dano de contacto que os monstros dao (dano
+# minimo continua a ser 1, para uma armadura nunca tornar o jogador
+# totalmente imune). Vendidas pelo Armeiro, guardadas no mesmo inventario
+# das armas (o inventario agora tem os dois "slots": arma e armadura).
+ARMADURAS = {
+    "armadura_couro": {"nome": "Armadura de Couro", "defesa": 4},
+    "armadura_ferro": {"nome": "Armadura de Ferro", "defesa": 9},
+    "armadura_placas": {"nome": "Armadura de Placas", "defesa": 15},
+}
+
+# --- Sistema de niveis ------------------------------------------------
+# Cada monstro morto da experiencia (xp). Ao juntar xp suficiente, o
+# jogador sobe de nivel: fica com mais vida maxima (e cura tudo) e ganha
+# um pequeno bonus de dano fixo, que soma ao dano da arma equipada.
+XP_BASE_POR_NIVEL = 25      # nivel 1->2 precisa de 25xp, 2->3 de 50xp, etc.
+VIDA_BONUS_POR_NIVEL = 15
+DANO_BONUS_POR_NIVEL = 1    # por nivel acima do 1
+
+
+def xp_necessario(nivel):
+    return XP_BASE_POR_NIVEL * nivel
+
+
+def ganhar_xp(info, quantidade):
+    """Soma xp ao jogador e sobe de nivel quantas vezes for preciso.
+    Sobe de nivel = mais vida maxima + cura completa + bonus de dano."""
+    if quantidade <= 0:
+        return
+    info["xp"] += quantidade
+    while info["xp"] >= xp_necessario(info["nivel"]):
+        info["xp"] -= xp_necessario(info["nivel"])
+        info["nivel"] += 1
+        info["vida_max"] += VIDA_BONUS_POR_NIVEL
+        info["vida"] = info["vida_max"]
+
+
+def bonus_dano_nivel(info):
+    return (info["nivel"] - 1) * DANO_BONUS_POR_NIVEL
+
+
+# --- Missao de cacada ---------------------------------------------------
+# Missao simples e repetivel: derrotar N monstros de um certo tipo. Os
+# "bichos redondos" da missao sao os slimes.
+MISSAO_TIPO_ALVO = "slime"
+MISSAO_QTD_ALVO = 5
+MISSAO_RECOMPENSA_MOEDAS = 40
+MISSAO_RECOMPENSA_XP = 30
+
 # NPCs fixos, organizados por mapa.
 NPCS_POR_MAPA = {
     "arena": [
@@ -79,8 +128,28 @@ NPCS_POR_MAPA = {
                 {"id": "espada_flamejante", "nome": "Espada Flamejante", "preco": 120},
             ],
         },
+        {
+            "id": "armeiro",
+            "nome": "Armeiro",
+            "x": 480, "y": 130,
+            "loja": True,
+            "falas": [],
+            "itens": [
+                {"id": "armadura_couro", "nome": "Armadura de Couro", "preco": 20},
+                {"id": "armadura_ferro", "nome": "Armadura de Ferro", "preco": 55},
+                {"id": "armadura_placas", "nome": "Armadura de Placas", "preco": 100},
+            ],
+        },
     ],
-    "missao1": [],
+    "missao1": [
+        {
+            "id": "cacador",
+            "nome": "Cacador",
+            "x": 60, "y": 150,
+            "missao": True,
+            "falas": [],
+        },
+    ],
 }
 
 # Ponto de "renascimento" de cada mapa, para quando um jogador morre.
@@ -96,10 +165,11 @@ MAPA_SPAWN = {
 MONSTROS_POR_MAPA = {
     "arena": [],
     "missao1": [
-        {"id": "slime_1", "tipo": "slime", "x": 250, "y": 150, "vida_max": 30, "dano": 6, "moedas": 5, "patrulha": 50},
-        {"id": "slime_2", "tipo": "slime", "x": 420, "y": 380, "vida_max": 30, "dano": 6, "moedas": 5, "patrulha": 50},
-        {"id": "morcego_1", "tipo": "morcego", "x": 550, "y": 220, "vida_max": 18, "dano": 4, "moedas": 3, "patrulha": 0},
-        {"id": "orc_1", "tipo": "orc", "x": 700, "y": 300, "vida_max": 60, "dano": 12, "moedas": 15, "patrulha": 70},
+        {"id": "slime_1", "tipo": "slime", "x": 250, "y": 150, "vida_max": 30, "dano": 6, "moedas": 5, "xp": 8, "patrulha": 50},
+        {"id": "slime_2", "tipo": "slime", "x": 420, "y": 380, "vida_max": 30, "dano": 6, "moedas": 5, "xp": 8, "patrulha": 50},
+        {"id": "slime_3", "tipo": "slime", "x": 130, "y": 380, "vida_max": 30, "dano": 6, "moedas": 5, "xp": 8, "patrulha": 40},
+        {"id": "morcego_1", "tipo": "morcego", "x": 550, "y": 220, "vida_max": 18, "dano": 4, "moedas": 3, "xp": 5, "patrulha": 0},
+        {"id": "orc_1", "tipo": "orc", "x": 700, "y": 300, "vida_max": 60, "dano": 12, "moedas": 15, "xp": 25, "patrulha": 70},
     ],
 }
 
@@ -146,13 +216,64 @@ def encontrar_item_loja(npc_id, item_id):
 
 
 def info_inventario(info):
-    """Monta a lista de itens do inventario (com nome e dano) para mandar
-    ao cliente, mais qual esta equipada neste momento."""
+    """Monta a lista de itens do inventario (armas E armaduras) para
+    mandar ao cliente, cada um com o seu "tipo" (arma/armadura) e um
+    "valor" (dano ou defesa, conforme o tipo), mais qual arma e qual
+    armadura estao equipadas neste momento."""
     itens = []
     for item_id in info["inventario"]:
-        arma = ARMAS.get(item_id, {"nome": item_id, "dano": 0})
-        itens.append({"id": item_id, "nome": arma["nome"], "dano": arma["dano"]})
-    return {"tipo": "inventario", "itens": itens, "equipada": info["arma_equipada"]}
+        if item_id in ARMADURAS:
+            dados = ARMADURAS[item_id]
+            itens.append({"id": item_id, "nome": dados["nome"], "tipo": "armadura", "valor": dados["defesa"]})
+        else:
+            dados = ARMAS.get(item_id, {"nome": item_id, "dano": 0})
+            itens.append({"id": item_id, "nome": dados["nome"], "tipo": "arma", "valor": dados["dano"]})
+    return {
+        "tipo": "inventario",
+        "itens": itens,
+        "equipada": info["arma_equipada"],
+        "armadura_equipada": info.get("armadura_equipada"),
+    }
+
+
+def defesa_atual(info):
+    armadura = ARMADURAS.get(info.get("armadura_equipada"))
+    return armadura["defesa"] if armadura else 0
+
+
+def falas_missao(info):
+    """Constroi a conversa do Cacador consoante o estado da missao deste
+    jogador: ainda nao aceite, em curso, pronta a entregar (da' a
+    recompensa nesse momento), ou recem-entregue."""
+    if info.get("missao_completa"):
+        info["missao_completa"] = False
+        info["missao_ativa"] = False
+        info["missao_progresso"] = 0
+        info["missao_entregas"] = info.get("missao_entregas", 0) + 1
+        info["moedas"] += MISSAO_RECOMPENSA_MOEDAS
+        ganhar_xp(info, MISSAO_RECOMPENSA_XP)
+        return [
+            "Boa! Trouxeste provas de que limpaste aqueles bichos redondos.",
+            f"Toma a tua recompensa: {MISSAO_RECOMPENSA_MOEDAS} moedas e {MISSAO_RECOMPENSA_XP} de experiencia.",
+            "Se quiseres, ha sempre mais slimes onde foste buscar esses.",
+        ]
+
+    if not info.get("missao_ativa"):
+        info["missao_ativa"] = True
+        info["missao_progresso"] = 0
+        return [
+            "Preciso de ajuda com uma praga de bichos redondos por aqui.",
+            f"Derrota {MISSAO_QTD_ALVO} slimes e traz-me a noticia.",
+            f"Pago bem: {MISSAO_RECOMPENSA_MOEDAS} moedas e {MISSAO_RECOMPENSA_XP} de experiencia.",
+        ]
+
+    faltam = max(0, MISSAO_QTD_ALVO - info.get("missao_progresso", 0))
+    if faltam > 0:
+        return [
+            f"Ja derrotaste {info.get('missao_progresso', 0)} de {MISSAO_QTD_ALVO} slimes.",
+            f"Faltam {faltam}. Continua a cacar e volta quando acabares.",
+        ]
+    return ["Ja acabaste? Fala comigo outra vez para receberes a recompensa."]
 
 
 # Guarda o estado de cada jogador ligado
@@ -193,7 +314,10 @@ def transmitir_estado():
                 "mapa": info["mapa"],
                 "jogadores": por_mapa.get(info["mapa"], {}),
                 "monstros": monstros_por_mapa_vivos.get(info["mapa"], {}),
-                "eu": {"vida": info["vida"], "vida_max": info["vida_max"], "moedas": info["moedas"]},
+                "eu": {
+                    "vida": info["vida"], "vida_max": info["vida_max"], "moedas": info["moedas"],
+                    "nivel": info["nivel"], "xp": info["xp"], "xp_prox": xp_necessario(info["nivel"]),
+                },
             }
             enviar(info["conn"], estado)
 
@@ -239,7 +363,8 @@ def loop_monstros():
                         dist = math.hypot(info["x"] - m["x"], info["y"] - m["y"])
                         if dist < RAIO_CONTATO and (agora - info.get("ultimo_dano", 0)) >= COOLDOWN_DANO_CONTATO:
                             info["ultimo_dano"] = agora
-                            info["vida"] -= m["dano"]
+                            dano_sofrido = max(1, m["dano"] - defesa_atual(info))
+                            info["vida"] -= dano_sofrido
                             houve_mudanca = True
                             if info["vida"] <= 0:
                                 info["vida"] = info["vida_max"]
@@ -270,15 +395,25 @@ def tratar_cliente(conn, addr):
             # como antes.
             "inventario": ["espada_curta"],
             "arma_equipada": "espada_curta",
+            "armadura_equipada": None,
             "vida": VIDA_INICIAL, "vida_max": VIDA_INICIAL,
             "ultimo_ataque": 0.0,
             "ultimo_dano": 0.0,
+            "nivel": 1,
+            "xp": 0,
+            "missao_ativa": False,
+            "missao_progresso": 0,
+            "missao_completa": False,
+            "missao_entregas": 0,
         }
         info_local = jogadores[meu_id]
 
     print(f"[+] Jogador {meu_id} ligou-se de {addr}")
 
-    enviar(conn, {"tipo": "bem_vindo", "id": meu_id, "moedas": MOEDAS_INICIAIS, "vida": VIDA_INICIAL})
+    enviar(conn, {
+        "tipo": "bem_vindo", "id": meu_id, "moedas": MOEDAS_INICIAIS, "vida": VIDA_INICIAL,
+        "nivel": 1, "xp": 0, "xp_prox": xp_necessario(1),
+    })
     enviar(conn, {"tipo": "npcs", "npcs": NPCS_POR_MAPA.get("arena", [])})
     enviar(conn, info_inventario(info_local))
     transmitir_estado()
@@ -345,13 +480,17 @@ def tratar_cliente(conn, addr):
 
                 elif tipo == "equipar":
                     item_id = msg.get("item_id")
+                    slot = msg.get("slot", "arma")
                     with lock:
                         info = jogadores.get(meu_id)
                         if info is None:
                             continue
-                        # None = "desequipar" (voltar a lutar aos punhos)
+                        # None = "desequipar" esse slot
                         if item_id is None or item_id in info["inventario"]:
-                            info["arma_equipada"] = item_id
+                            if slot == "armadura":
+                                info["armadura_equipada"] = item_id
+                            else:
+                                info["arma_equipada"] = item_id
                             enviar(conn, info_inventario(info))
 
                 elif tipo == "atacar":
@@ -374,15 +513,34 @@ def tratar_cliente(conn, addr):
                         if pode_atacar:
                             info["ultimo_ataque"] = agora
                             arma = ARMAS.get(info["arma_equipada"])
-                            dano = arma["dano"] if arma else DANO_PUNHOS
+                            dano_base = arma["dano"] if arma else DANO_PUNHOS
+                            dano = dano_base + bonus_dano_nivel(info)
                             monstro["vida"] -= dano
 
                             morreu = monstro["vida"] <= 0
+                            subiu_nivel = False
                             if morreu:
                                 monstro["vivo"] = False
                                 monstro["vida"] = 0
                                 monstro["hora_morte"] = agora
                                 info["moedas"] += monstro["moedas"]
+
+                                nivel_antes = info["nivel"]
+                                ganhar_xp(info, monstro.get("xp", 0))
+                                subiu_nivel = info["nivel"] > nivel_antes
+
+                                # progresso da missao de cacada (so conta
+                                # se a missao estiver ativa e ainda nao
+                                # tiver sido concluida)
+                                if (
+                                    monstro["tipo"] == MISSAO_TIPO_ALVO
+                                    and info.get("missao_ativa")
+                                    and not info.get("missao_completa")
+                                ):
+                                    info["missao_progresso"] = info.get("missao_progresso", 0) + 1
+                                    if info["missao_progresso"] >= MISSAO_QTD_ALVO:
+                                        info["missao_progresso"] = MISSAO_QTD_ALVO
+                                        info["missao_completa"] = True
 
                             enviar(conn, {
                                 "tipo": "acerto",
@@ -390,7 +548,26 @@ def tratar_cliente(conn, addr):
                                 "dano": dano,
                                 "morreu": morreu,
                                 "moedas": info["moedas"],
+                                "subiu_nivel": subiu_nivel,
+                                "nivel": info["nivel"],
                             })
+                    transmitir_estado()
+
+                elif tipo == "consultar_missao":
+                    npc_id = msg.get("npc_id")
+                    with lock:
+                        info = jogadores.get(meu_id)
+                        if info is None:
+                            continue
+                        falas = falas_missao(info)
+                        enviar(conn, {
+                            "tipo": "missao_dialogo",
+                            "npc_id": npc_id,
+                            "nome": "Cacador",
+                            "falas": falas,
+                            "moedas": info["moedas"],
+                        })
+                        enviar(conn, info_inventario(info))
                     transmitir_estado()
 
     except (ConnectionResetError, json.JSONDecodeError):
