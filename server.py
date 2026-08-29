@@ -369,6 +369,227 @@ COMPRIMENTO_MAX_CHAT = 140
 COOLDOWN_CHAT = 0.5         # segundos minimos entre mensagens de chat da mesma pessoa
 INTERVALO_AUTOSAVE = 20.0   # segundos entre gravacoes automaticas na base de dados
 
+# --- Staff / dono do jogo -------------------------------------------------
+# O jogador com este nome (login) e' reconhecido automaticamente como "Owner"
+# e ganha acesso aos comandos de staff (escritos no chat, a comecar por "/").
+# A comparacao ignora maiusculas/minusculas, para nao depender de escreveres
+# o nome sempre exatamente igual.
+NOME_OWNER = "EuGhoooost"
+
+# Lista de comandos disponiveis, so' para referencia rapida no /ajuda.
+COMANDOS_STAFF = [
+    ("/ajuda", "Mostra esta lista de comandos."),
+    ("/anunciar <texto>", "Manda uma mensagem a todos os jogadores ligados."),
+    ("/curar [jogador]", "Cura por completo (a ti ou a alguem)."),
+    ("/vida <valor> [jogador]", "Define a vida atual (a ti ou a alguem)."),
+    ("/moedas <valor> [jogador]", "Da (ou tira, com valor negativo) moedas."),
+    ("/nivel <valor> [jogador]", "Define o nivel (recalcula vida maxima)."),
+    ("/tp <mapa>", "Teleporta-te para o spawn desse mapa (arena/missao1)."),
+    ("/ir <jogador>", "Teleporta-te para onde esse jogador esta."),
+    ("/trazer <jogador>", "Teleporta esse jogador para onde tu estas."),
+    ("/god", "Liga/desliga a tua invencibilidade a monstros."),
+    ("/kick <jogador>", "Desliga esse jogador do servidor."),
+    ("/jogadores", "Lista quem esta ligado agora e em que mapa."),
+]
+
+
+def eh_staff(nome: str) -> bool:
+    """Verdade se este nome de conta e' reconhecido como Owner/staff."""
+    return (nome or "").strip().lower() == NOME_OWNER.lower()
+
+
+def encontrar_jogador_por_nome(nome: str):
+    """Devolve o dicionario do jogador ligado com este nome (sem
+    depender de maiusculas/minusculas), ou None se ninguem estiver ligado
+    com esse nome. Chamar sempre com o `lock` ja adquirido."""
+    alvo = (nome or "").strip().lower()
+    for info in jogadores.values():
+        if info["nome"].strip().lower() == alvo:
+            return info
+    return None
+
+
+def mensagem_sistema(conn, texto: str):
+    """Manda uma mensagem 'de sistema' (visivel so' para quem recebe),
+    reaproveitando a caixa de chat do cliente."""
+    enviar(conn, {
+        "tipo": "chat_mensagem", "id": -1, "nome": "Sistema", "texto": texto,
+    })
+
+
+def processar_comando(info, conn, texto_comando):
+    """Interpreta um comando de staff (ex: '/curar Fulano') e executa-o.
+    So' e' chamado depois de confirmar que quem escreveu e' staff."""
+    partes = texto_comando.strip().split()
+    if not partes:
+        return
+    nome_cmd = partes[0].lower()
+    args = partes[1:]
+
+    if nome_cmd == "/ajuda":
+        mensagem_sistema(conn, "== Comandos de staff ==")
+        for cmd, descricao in COMANDOS_STAFF:
+            mensagem_sistema(conn, f"{cmd} — {descricao}")
+        return
+
+    if nome_cmd == "/anunciar":
+        texto_aviso = " ".join(args).strip()
+        if not texto_aviso:
+            mensagem_sistema(conn, "Usa: /anunciar <texto>")
+            return
+        aviso = {
+            "tipo": "chat_mensagem", "id": -1,
+            "nome": "📢 Aviso do Owner", "texto": texto_aviso,
+        }
+        for j in jogadores.values():
+            enviar(j["conn"], aviso)
+        return
+
+    if nome_cmd == "/jogadores":
+        if not jogadores:
+            mensagem_sistema(conn, "Nao ha ninguem ligado.")
+            return
+        mensagem_sistema(conn, f"Ligados ({len(jogadores)}):")
+        for j in jogadores.values():
+            mensagem_sistema(conn, f"- {j['nome']} (mapa: {j['mapa']}, nivel {j['nivel']})")
+        return
+
+    if nome_cmd == "/curar":
+        alvo = encontrar_jogador_por_nome(args[0]) if args else info
+        if alvo is None:
+            mensagem_sistema(conn, f"Nao encontrei o jogador '{args[0]}'.")
+            return
+        alvo["vida"] = alvo["vida_max"]
+        mensagem_sistema(conn, f"{alvo['nome']} foi curado por completo.")
+        if alvo is not info:
+            mensagem_sistema(alvo["conn"], f"{info['nome']} curou-te por completo.")
+        bd.guardar_jogador(alvo)
+        return
+
+    if nome_cmd == "/vida":
+        if not args or not args[0].lstrip("-").isdigit():
+            mensagem_sistema(conn, "Usa: /vida <valor> [jogador]")
+            return
+        valor = int(args[0])
+        alvo = encontrar_jogador_por_nome(args[1]) if len(args) > 1 else info
+        if alvo is None:
+            mensagem_sistema(conn, f"Nao encontrei o jogador '{args[1]}'.")
+            return
+        alvo["vida"] = max(1, min(valor, alvo["vida_max"]))
+        mensagem_sistema(conn, f"Vida de {alvo['nome']} definida para {alvo['vida']}.")
+        if alvo is not info:
+            mensagem_sistema(alvo["conn"], f"{info['nome']} ajustou a tua vida para {alvo['vida']}.")
+        bd.guardar_jogador(alvo)
+        return
+
+    if nome_cmd == "/moedas":
+        if not args or not args[0].lstrip("-").isdigit():
+            mensagem_sistema(conn, "Usa: /moedas <valor> [jogador]")
+            return
+        valor = int(args[0])
+        alvo = encontrar_jogador_por_nome(args[1]) if len(args) > 1 else info
+        if alvo is None:
+            mensagem_sistema(conn, f"Nao encontrei o jogador '{args[1]}'.")
+            return
+        alvo["moedas"] = max(0, alvo["moedas"] + valor)
+        mensagem_sistema(conn, f"{alvo['nome']} tem agora {alvo['moedas']} moedas.")
+        if alvo is not info:
+            mensagem_sistema(alvo["conn"], f"{info['nome']} deu-te {valor} moedas! Tens {alvo['moedas']}.")
+        bd.guardar_jogador(alvo)
+        return
+
+    if nome_cmd == "/nivel":
+        if not args or not args[0].isdigit() or int(args[0]) < 1:
+            mensagem_sistema(conn, "Usa: /nivel <valor> [jogador]")
+            return
+        valor = int(args[0])
+        alvo = encontrar_jogador_por_nome(args[1]) if len(args) > 1 else info
+        if alvo is None:
+            mensagem_sistema(conn, f"Nao encontrei o jogador '{args[1]}'.")
+            return
+        alvo["nivel"] = valor
+        alvo["xp"] = 0
+        alvo["vida_max"] = VIDA_INICIAL + VIDA_BONUS_POR_NIVEL * (valor - 1)
+        alvo["vida"] = alvo["vida_max"]
+        mensagem_sistema(conn, f"{alvo['nome']} passou a nivel {valor}.")
+        if alvo is not info:
+            mensagem_sistema(alvo["conn"], f"{info['nome']} pos-te no nivel {valor}!")
+        bd.guardar_jogador(alvo)
+        return
+
+    if nome_cmd == "/tp":
+        if not args or args[0] not in MAPA_SPAWN:
+            mapas_validos = ", ".join(MAPA_SPAWN.keys())
+            mensagem_sistema(conn, f"Usa: /tp <mapa> (mapas: {mapas_validos})")
+            return
+        mapa_destino = args[0]
+        info["mapa"] = mapa_destino
+        info["x"], info["y"] = MAPA_SPAWN[mapa_destino]
+        enviar(conn, {"tipo": "npcs", "npcs": NPCS_POR_MAPA.get(mapa_destino, [])})
+        mensagem_sistema(conn, f"Teleportado para '{mapa_destino}'.")
+        bd.guardar_jogador(info)
+        return
+
+    if nome_cmd == "/ir":
+        if not args:
+            mensagem_sistema(conn, "Usa: /ir <jogador>")
+            return
+        alvo = encontrar_jogador_por_nome(args[0])
+        if alvo is None:
+            mensagem_sistema(conn, f"Nao encontrei o jogador '{args[0]}'.")
+            return
+        mudou_mapa = info["mapa"] != alvo["mapa"]
+        info["mapa"] = alvo["mapa"]
+        info["x"], info["y"] = alvo["x"], alvo["y"]
+        if mudou_mapa:
+            enviar(conn, {"tipo": "npcs", "npcs": NPCS_POR_MAPA.get(alvo["mapa"], [])})
+        mensagem_sistema(conn, f"Teleportado para junto de {alvo['nome']}.")
+        return
+
+    if nome_cmd == "/trazer":
+        if not args:
+            mensagem_sistema(conn, "Usa: /trazer <jogador>")
+            return
+        alvo = encontrar_jogador_por_nome(args[0])
+        if alvo is None:
+            mensagem_sistema(conn, f"Nao encontrei o jogador '{args[0]}'.")
+            return
+        mudou_mapa = alvo["mapa"] != info["mapa"]
+        alvo["mapa"] = info["mapa"]
+        alvo["x"], alvo["y"] = info["x"], info["y"]
+        if mudou_mapa:
+            enviar(alvo["conn"], {"tipo": "npcs", "npcs": NPCS_POR_MAPA.get(info["mapa"], [])})
+        mensagem_sistema(conn, f"{alvo['nome']} foi teleportado ate ti.")
+        mensagem_sistema(alvo["conn"], f"{info['nome']} teleportou-te ate ele/ela.")
+        return
+
+    if nome_cmd == "/god":
+        info["god"] = not info.get("god", False)
+        estado = "ATIVADA" if info["god"] else "DESATIVADA"
+        mensagem_sistema(conn, f"Invencibilidade {estado}.")
+        return
+
+    if nome_cmd == "/kick":
+        if not args:
+            mensagem_sistema(conn, "Usa: /kick <jogador>")
+            return
+        alvo = encontrar_jogador_por_nome(args[0])
+        if alvo is None:
+            mensagem_sistema(conn, f"Nao encontrei o jogador '{args[0]}'.")
+            return
+        if eh_staff(alvo["nome"]):
+            mensagem_sistema(conn, "Nao podes expulsar outro membro da staff.")
+            return
+        mensagem_sistema(alvo["conn"], "Foste expulso do servidor por um membro da staff.")
+        try:
+            alvo["conn"].close()
+        except OSError:
+            pass
+        mensagem_sistema(conn, f"{alvo['nome']} foi expulso.")
+        return
+
+    mensagem_sistema(conn, f"Comando desconhecido: {nome_cmd}. Escreve /ajuda para veres a lista.")
+
 
 def enviar(conn, dados: dict):
     try:
@@ -453,6 +674,8 @@ def loop_monstros():
                         if info["mapa"] != mapa:
                             continue
                         dist = math.hypot(info["x"] - m["x"], info["y"] - m["y"])
+                        if info.get("god"):
+                            continue  # staff com invencibilidade ligada: ignora dano de contacto
                         if dist < RAIO_CONTATO and (agora - info.get("ultimo_dano", 0)) >= COOLDOWN_DANO_CONTATO:
                             info["ultimo_dano"] = agora
                             dano_sofrido = max(1, m["dano"] - defesa_atual(info))
@@ -566,6 +789,7 @@ def tratar_cliente(conn, addr):
                             "ultimo_ataque": 0.0,
                             "ultimo_dano": 0.0,
                             "ultimo_chat": 0.0,
+                            "god": False,
                             "nivel": registo["nivel"],
                             "xp": registo["xp"],
                             "habilidades": registo["habilidades"],
@@ -782,17 +1006,36 @@ def tratar_cliente(conn, addr):
                         info = jogadores.get(meu_id)
                         if info is None or not texto_chat:
                             continue
-                        if (agora_chat - info.get("ultimo_chat", 0.0)) < COOLDOWN_CHAT:
-                            continue
-                        info["ultimo_chat"] = agora_chat
-                        # chat "local": so' quem esta no mesmo mapa ve a mensagem
-                        destinatarios = [j["conn"] for j in jogadores.values() if j["mapa"] == info["mapa"]]
-                        mensagem_chat = {
-                            "tipo": "chat_mensagem",
-                            "id": meu_id,
-                            "nome": info["nome"],
-                            "texto": texto_chat,
-                        }
+
+                        # Comandos de staff (ex: "/curar", "/tp arena"): so'
+                        # funcionam para o Owner e nunca sao vistos por mais
+                        # ninguem no chat. Nao levam o cooldown normal do
+                        # chat, para a staff poder encadear varios comandos.
+                        eh_comando = texto_chat.startswith("/")
+                        if eh_comando:
+                            if eh_staff(info["nome"]):
+                                processar_comando(info, conn, texto_chat)
+                            else:
+                                mensagem_sistema(conn, "Nao tens permissao para usar comandos.")
+                            destinatarios = None
+                        else:
+                            if (agora_chat - info.get("ultimo_chat", 0.0)) < COOLDOWN_CHAT:
+                                continue
+                            info["ultimo_chat"] = agora_chat
+                            # chat "local": so' quem esta no mesmo mapa ve a mensagem
+                            destinatarios = [j["conn"] for j in jogadores.values() if j["mapa"] == info["mapa"]]
+                            mensagem_chat = {
+                                "tipo": "chat_mensagem",
+                                "id": meu_id,
+                                "nome": info["nome"],
+                                "texto": texto_chat,
+                            }
+                    if destinatarios is None:
+                        if eh_comando:
+                            # Um comando pode ter mudado posicao/vida/moedas etc.
+                            # (ex: /tp, /curar, /vida) — atualiza todos os clientes.
+                            transmitir_estado()
+                        continue
                     for c in destinatarios:
                         enviar(c, mensagem_chat)
 
