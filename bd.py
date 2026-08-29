@@ -5,14 +5,20 @@ Antes desta etapa, tudo o que um jogador tinha (moedas, nivel, itens,
 habilidades...) vivia so na memoria do servidor: assim que o servidor
 era reiniciado, perdia-se tudo e todos comecavam do zero outra vez.
 
-Agora cada jogador escolhe um NOME ao ligar-se (ver tela_escrever_nome no
-cliente e a mensagem "login" no servidor). Esse nome e' a identidade do
-jogador:
-    - Se e' a primeira vez que esse nome aparece, criamos uma linha nova
-      na base de dados (com o proximo id livre a comecar em 1).
-    - Se o nome ja existe, carregamos o que la estava (moedas, nivel,
-      inventario, habilidades, posicao, etc.) e o jogador continua
-      exatamente de onde tinha ficado.
+Agora cada jogador tem uma CONTA (nome de utilizador + password), como em
+qualquer jogo a serio:
+    - Se e' a primeira vez que esse nome aparece, criamos a conta na hora
+      com a password que a pessoa escreveu (o proximo id livre a comecar
+      em 1).
+    - Se o nome ja existe, a password tem de bater certo com a guardada
+      para se poder entrar. So' ai carregamos o progresso guardado
+      (moedas, nivel, inventario, habilidades, posicao, etc.).
+
+A password NUNCA e' guardada em texto simples: guardamos so' um "hash"
+(um resumo criado de forma a nao dar para voltar atras) feito com um
+"sal" (salt) proprio de cada conta, usando PBKDF2 (funcao standard do
+Python para isto, em hashlib). Mesmo que alguem abra o ficheiro
+jogadores.db, nao consegue ver as passwords, so os hashes.
 
 Guardamos periodicamente (e sempre que um jogador se desliga) o estado
 atual de volta na base de dados, para nada se perder.
@@ -23,15 +29,18 @@ momento para comecar tudo do zero, ou correr:
 
     python bd.py --reset
 
-para limpar a base de dados (apaga todos os jogadores guardados e faz os
+para limpar a base de dados (apaga todas as contas guardadas e faz os
 proximos ids voltarem a comecar no 1).
 """
 import sqlite3
 import json
 import os
+import hashlib
 import threading
 
 CAMINHO_BD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jogadores.db")
+
+ITERACOES_HASH = 100_000   # quantas voltas o PBKDF2 da' - mais voltas, mais lento para alguem tentar adivinhar passwords
 
 _lock = threading.Lock()
 _ligacao = None
@@ -58,6 +67,8 @@ def inicializar():
             CREATE TABLE IF NOT EXISTS jogadores (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
                 nome                TEXT NOT NULL UNIQUE,
+                senha_hash          TEXT NOT NULL DEFAULT '',
+                senha_salt          TEXT NOT NULL DEFAULT '',
                 moedas              INTEGER NOT NULL DEFAULT 0,
                 vida                INTEGER NOT NULL DEFAULT 100,
                 vida_max            INTEGER NOT NULL DEFAULT 100,
@@ -83,7 +94,7 @@ def inicializar():
 
 
 def resetar_tudo():
-    """Apaga TODOS os jogadores guardados e faz os proximos ids voltarem a
+    """Apaga TODAS as contas guardadas e faz os proximos ids voltarem a
     comecar no 1. Usar com cuidado - e' o "reset" completo da base de
     dados (ver 'python bd.py --reset')."""
     with _lock:
@@ -91,6 +102,13 @@ def resetar_tudo():
         con.execute("DELETE FROM jogadores")
         con.execute("DELETE FROM sqlite_sequence WHERE name='jogadores'")
         con.commit()
+
+
+def _gerar_hash(senha, salt_bytes):
+    """PBKDF2-HMAC-SHA256: forma standard e lenta-de-propositio de
+    transformar uma password num hash, para dificultar quem tentar
+    adivinhar passwords a partir de uma copia da base de dados."""
+    return hashlib.pbkdf2_hmac("sha256", senha.encode("utf-8"), salt_bytes, ITERACOES_HASH)
 
 
 def _linha_para_dict(linha):
@@ -117,31 +135,48 @@ def _linha_para_dict(linha):
     }
 
 
-def carregar_por_nome(nome):
-    """Devolve o dicionario do jogador guardado com este nome (procura
-    ignorando maiusculas/minusculas, para 'Ana' e 'ana' serem a mesma
-    pessoa), ou None se ainda nao existir ninguem com esse nome."""
+def autenticar(nome, senha, moedas_iniciais, vida_inicial, inventario_inicial, arma_inicial):
+    """Tenta entrar com este nome + password.
+
+    Devolve sempre um par (status, dados):
+        ("novo", dados)          -> nome nao existia, conta criada agora
+        ("ok", dados)            -> nome existia e a password bateu certo
+        ("senha_errada", None)   -> nome existe mas a password nao bate certo
+
+    'dados' e' o dicionario do jogador (ver _linha_para_dict), pronto a
+    usar para preencher o estado inicial dele no servidor.
+    """
     with _lock:
         con = obter_ligacao()
         linha = con.execute(
             "SELECT * FROM jogadores WHERE nome = ? COLLATE NOCASE", (nome,)
         ).fetchone()
-        return _linha_para_dict(linha) if linha else None
 
+        if linha is None:
+            salt = os.urandom(16)
+            hash_ = _gerar_hash(senha, salt)
+            cursor = con.execute(
+                """INSERT INTO jogadores
+                       (nome, senha_hash, senha_salt, moedas, vida, vida_max, inventario, arma_equipada, ultimo_login)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                (
+                    nome, hash_.hex(), salt.hex(),
+                    moedas_iniciais, vida_inicial, vida_inicial,
+                    json.dumps(inventario_inicial), arma_inicial,
+                ),
+            )
+            con.commit()
+            nova_linha = con.execute("SELECT * FROM jogadores WHERE id = ?", (cursor.lastrowid,)).fetchone()
+            return "novo", _linha_para_dict(nova_linha)
 
-def criar_jogador(nome, moedas_iniciais, vida_inicial, inventario_inicial, arma_inicial):
-    """Regista um jogador novo (primeira vez que este nome aparece) com os
-    valores de partida do jogo, e devolve o registo ja com o id atribuido."""
-    with _lock:
-        con = obter_ligacao()
-        cursor = con.execute(
-            """INSERT INTO jogadores (nome, moedas, vida, vida_max, inventario, arma_equipada, ultimo_login)
-               VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
-            (nome, moedas_iniciais, vida_inicial, vida_inicial, json.dumps(inventario_inicial), arma_inicial),
-        )
+        salt = bytes.fromhex(linha["senha_salt"])
+        hash_dado = _gerar_hash(senha, salt).hex()
+        if hash_dado != linha["senha_hash"]:
+            return "senha_errada", None
+
+        con.execute("UPDATE jogadores SET ultimo_login = CURRENT_TIMESTAMP WHERE id = ?", (linha["id"],))
         con.commit()
-        linha = con.execute("SELECT * FROM jogadores WHERE id = ?", (cursor.lastrowid,)).fetchone()
-        return _linha_para_dict(linha)
+        return "ok", _linha_para_dict(linha)
 
 
 def guardar_jogador(info):
@@ -176,13 +211,14 @@ if __name__ == "__main__":
     inicializar()
     if "--reset" in sys.argv:
         resposta = input(
-            "Isto apaga TODOS os jogadores guardados em jogadores.db. Escreve 'sim' para confirmar: "
+            "Isto apaga TODAS as contas guardadas em jogadores.db. Escreve 'sim' para confirmar: "
         )
         if resposta.strip().lower() == "sim":
             resetar_tudo()
-            print("Base de dados limpa. Os proximos jogadores a entrar comecam do id 1.")
+            print("Base de dados limpa. As proximas contas a entrar comecam do id 1.")
         else:
             print("Cancelado, nada foi apagado.")
     else:
         print(f"Base de dados em: {CAMINHO_BD}")
-        print("Usa 'python bd.py --reset' para limpar todos os jogadores guardados.")
+        print("Usa 'python bd.py --reset' para limpar todas as contas guardadas.")
+
