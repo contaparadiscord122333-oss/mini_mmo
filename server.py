@@ -26,6 +26,9 @@ import json
 import os
 import time
 import math
+import random
+
+import bd
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", 8080))
@@ -79,10 +82,91 @@ def ganhar_xp(info, quantidade):
         info["nivel"] += 1
         info["vida_max"] += VIDA_BONUS_POR_NIVEL
         info["vida"] = info["vida_max"]
+        info["pontos_habilidade"] = info.get("pontos_habilidade", 0) + PONTOS_HABILIDADE_POR_NIVEL
 
 
 def bonus_dano_nivel(info):
     return (info["nivel"] - 1) * DANO_BONUS_POR_NIVEL
+
+
+# --- Arvore de habilidades (Ataque / Agilidade) --------------------------
+# Cada no custa "pontos de habilidade" (ganhos ao subir de nivel) para
+# desbloquear, e pode exigir que outro(s) no(s) ja estejam desbloqueados
+# ("requisitos" = lista de ids, TODOS tem de estar desbloqueados). O
+# "efeito" soma-se ao de todos os outros nos desbloqueados: "dano" e' um
+# bonus fixo que se junta ao dano de ataque; "velocidade_pct" e' uma
+# percentagem extra de velocidade de movimento (o servidor manda o total
+# ao cliente, que e' quem de facto move o jogador no ecra).
+#
+# Esta e' a fonte da verdade: o servidor e' quem decide se um jogador pode
+# desbloquear um no (pontos suficientes + requisitos cumpridos), tal como
+# decide o resto do combate. O cliente so pede e desenha.
+PONTOS_HABILIDADE_POR_NIVEL = 1
+
+ARVORE_HABILIDADES = {
+    "fundamentos": {
+        "nome": "Fundamentos de Combate", "custo": 0, "requisitos": [],
+        "ramo": "geral", "efeito": {},
+    },
+    "ataque_1": {
+        "nome": "Golpe Firme", "custo": 1, "requisitos": ["fundamentos"],
+        "ramo": "ataque", "efeito": {"dano": 3},
+    },
+    "agilidade_1": {
+        "nome": "Passo Leve", "custo": 1, "requisitos": ["fundamentos"],
+        "ramo": "agilidade", "efeito": {"velocidade_pct": 10},
+    },
+    "ataque_2": {
+        "nome": "Golpe Pesado", "custo": 1, "requisitos": ["ataque_1"],
+        "ramo": "ataque", "efeito": {"dano": 5},
+    },
+    "furia_selvagem": {
+        "nome": "Furia Selvagem", "custo": 2, "requisitos": ["ataque_1", "agilidade_1"],
+        "ramo": "geral", "efeito": {"dano": 6, "velocidade_pct": 6},
+    },
+    "agilidade_2": {
+        "nome": "Corrida", "custo": 1, "requisitos": ["agilidade_1"],
+        "ramo": "agilidade", "efeito": {"velocidade_pct": 12},
+    },
+    "combo_mortal": {
+        "nome": "Combo Mortal", "custo": 2, "requisitos": ["ataque_2"],
+        "ramo": "ataque", "efeito": {"dano": 10},
+    },
+    "vento_fugaz": {
+        "nome": "Vento Fugaz", "custo": 2, "requisitos": ["agilidade_2"],
+        "ramo": "agilidade", "efeito": {"velocidade_pct": 18},
+    },
+    "mestre_combate": {
+        "nome": "Mestre do Combate", "custo": 3, "requisitos": ["combo_mortal", "vento_fugaz"],
+        "ramo": "geral", "efeito": {"dano": 15, "velocidade_pct": 20},
+    },
+}
+
+
+def bonus_dano_habilidades(info):
+    total = 0
+    for hab_id in info.get("habilidades", []):
+        no = ARVORE_HABILIDADES.get(hab_id)
+        if no:
+            total += no["efeito"].get("dano", 0)
+    return total
+
+
+def bonus_velocidade_pct_habilidades(info):
+    total = 0
+    for hab_id in info.get("habilidades", []):
+        no = ARVORE_HABILIDADES.get(hab_id)
+        if no:
+            total += no["efeito"].get("velocidade_pct", 0)
+    return total
+
+
+def info_habilidades(info):
+    return {
+        "tipo": "habilidades",
+        "desbloqueadas": list(info.get("habilidades", [])),
+        "pontos": info.get("pontos_habilidade", 0),
+    }
 
 
 # --- Missao de cacada ---------------------------------------------------
@@ -276,10 +360,12 @@ def falas_missao(info):
     return ["Ja acabaste? Fala comigo outra vez para receberes a recompensa."]
 
 
-# Guarda o estado de cada jogador ligado
+# Guarda o estado de cada jogador ligado (chave = id da base de dados)
 jogadores = {}
 lock = threading.Lock()
-proximo_id = 1
+
+COMPRIMENTO_MAX_NOME = 16
+INTERVALO_AUTOSAVE = 20.0   # segundos entre gravacoes automaticas na base de dados
 
 
 def enviar(conn, dados: dict):
@@ -299,7 +385,9 @@ def transmitir_estado():
     with lock:
         por_mapa = {}
         for pid, info in jogadores.items():
-            por_mapa.setdefault(info["mapa"], {})[str(pid)] = {"x": info["x"], "y": info["y"]}
+            por_mapa.setdefault(info["mapa"], {})[str(pid)] = {
+                "x": info["x"], "y": info["y"], "nome": info["nome"],
+            }
 
         monstros_por_mapa_vivos = {}
         for mapa, monstros in MONSTROS_ESTADO.items():
@@ -317,6 +405,8 @@ def transmitir_estado():
                 "eu": {
                     "vida": info["vida"], "vida_max": info["vida_max"], "moedas": info["moedas"],
                     "nivel": info["nivel"], "xp": info["xp"], "xp_prox": xp_necessario(info["nivel"]),
+                    "pontos_habilidade": info.get("pontos_habilidade", 0),
+                    "velocidade_pct": bonus_velocidade_pct_habilidades(info),
                 },
             }
             enviar(info["conn"], estado)
@@ -378,46 +468,22 @@ def loop_monstros():
             transmitir_estado()
 
 
-def tratar_cliente(conn, addr):
-    global proximo_id
+def loop_autosave():
+    """Corre para sempre numa thread separada: de tempos a tempos, grava
+    na base de dados o estado atual de todos os jogadores ligados, para
+    nao se perder nada se o servidor cair ou for desligado sem aviso."""
+    while True:
+        time.sleep(INTERVALO_AUTOSAVE)
+        with lock:
+            copia = list(jogadores.values())
+        for info in copia:
+            bd.guardar_jogador(info)
 
+
+def tratar_cliente(conn, addr):
     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-    with lock:
-        meu_id = proximo_id
-        proximo_id += 1
-        jogadores[meu_id] = {
-            "x": 100, "y": 100, "mapa": "arena",
-            "moedas": MOEDAS_INICIAIS, "conn": conn,
-            # Todo o jogador comeca ja com a Espada Curta (a espada que
-            # "apanha" na tela de introducao do cliente), em vez de comecar
-            # aos punhos. Continua a poder trocar de arma na loja/inventario
-            # como antes.
-            "inventario": ["espada_curta"],
-            "arma_equipada": "espada_curta",
-            "armadura_equipada": None,
-            "vida": VIDA_INICIAL, "vida_max": VIDA_INICIAL,
-            "ultimo_ataque": 0.0,
-            "ultimo_dano": 0.0,
-            "nivel": 1,
-            "xp": 0,
-            "missao_ativa": False,
-            "missao_progresso": 0,
-            "missao_completa": False,
-            "missao_entregas": 0,
-        }
-        info_local = jogadores[meu_id]
-
-    print(f"[+] Jogador {meu_id} ligou-se de {addr}")
-
-    enviar(conn, {
-        "tipo": "bem_vindo", "id": meu_id, "moedas": MOEDAS_INICIAIS, "vida": VIDA_INICIAL,
-        "nivel": 1, "xp": 0, "xp_prox": xp_necessario(1),
-    })
-    enviar(conn, {"tipo": "npcs", "npcs": NPCS_POR_MAPA.get("arena", [])})
-    enviar(conn, info_inventario(info_local))
-    transmitir_estado()
-
+    meu_id = None    # so fica definido depois de recebermos o "login" com o nome
     buffer = ""
     try:
         while True:
@@ -433,6 +499,78 @@ def tratar_cliente(conn, addr):
                 msg = json.loads(linha)
                 tipo = msg.get("tipo")
 
+                # --- login: tem de ser a primeira mensagem do cliente. Ate
+                # isto acontecer, ignoramos qualquer outra coisa que chegue
+                # (nao ha ainda nenhum jogador para aplicar essas acoes). ---
+                if tipo == "login":
+                    if meu_id is not None:
+                        continue  # ja fez login, ignora tentativas repetidas
+
+                    nome_pedido = (msg.get("nome") or "").strip()[:COMPRIMENTO_MAX_NOME]
+                    if not nome_pedido:
+                        nome_pedido = f"Jogador{random.randint(1000, 9999)}"
+
+                    with lock:
+                        ja_esta_a_jogar = any(
+                            info["nome"].lower() == nome_pedido.lower() for info in jogadores.values()
+                        )
+                        if ja_esta_a_jogar:
+                            enviar(conn, {
+                                "tipo": "login_erro",
+                                "mensagem": f'Ja ha alguem a jogar como "{nome_pedido}". Escolhe outro nome.',
+                            })
+                            continue
+
+                        registo = bd.carregar_por_nome(nome_pedido)
+                        if registo is None:
+                            registo = bd.criar_jogador(
+                                nome_pedido, MOEDAS_INICIAIS, VIDA_INICIAL,
+                                ["espada_curta"], "espada_curta",
+                            )
+                            print(f"[+] Novo jogador registado: {registo['nome']} (id {registo['id']})")
+                        else:
+                            print(f"[+] {registo['nome']} voltou a ligar-se (id {registo['id']})")
+
+                        meu_id = registo["id"]
+                        jogadores[meu_id] = {
+                            "id": meu_id,
+                            "nome": registo["nome"],
+                            "x": registo["x"], "y": registo["y"], "mapa": registo["mapa"],
+                            "moedas": registo["moedas"], "conn": conn,
+                            "inventario": registo["inventario"],
+                            "arma_equipada": registo["arma_equipada"],
+                            "armadura_equipada": registo["armadura_equipada"],
+                            "vida": registo["vida"], "vida_max": registo["vida_max"],
+                            "ultimo_ataque": 0.0,
+                            "ultimo_dano": 0.0,
+                            "nivel": registo["nivel"],
+                            "xp": registo["xp"],
+                            "habilidades": registo["habilidades"],
+                            "pontos_habilidade": registo["pontos_habilidade"],
+                            "missao_ativa": registo["missao_ativa"],
+                            "missao_progresso": registo["missao_progresso"],
+                            "missao_completa": registo["missao_completa"],
+                            "missao_entregas": registo["missao_entregas"],
+                        }
+                        info_local = jogadores[meu_id]
+
+                    print(f"[+] Jogador {meu_id} ({info_local['nome']}) ligou-se de {addr}")
+
+                    enviar(conn, {
+                        "tipo": "bem_vindo", "id": meu_id, "nome": info_local["nome"],
+                        "moedas": info_local["moedas"], "vida": info_local["vida"], "vida_max": info_local["vida_max"],
+                        "nivel": info_local["nivel"], "xp": info_local["xp"],
+                        "xp_prox": xp_necessario(info_local["nivel"]),
+                    })
+                    enviar(conn, {"tipo": "npcs", "npcs": NPCS_POR_MAPA.get(info_local["mapa"], [])})
+                    enviar(conn, info_inventario(info_local))
+                    enviar(conn, info_habilidades(info_local))
+                    transmitir_estado()
+                    continue
+
+                if meu_id is None:
+                    continue  # ainda sem login feito: ignora tudo o resto
+
                 if tipo == "mover":
                     with lock:
                         if meu_id in jogadores:
@@ -447,6 +585,7 @@ def tratar_cliente(conn, addr):
                             jogadores[meu_id]["mapa"] = novo_mapa
                             jogadores[meu_id]["x"] = msg["x"]
                             jogadores[meu_id]["y"] = msg["y"]
+                            bd.guardar_jogador(jogadores[meu_id])
                     enviar(conn, {"tipo": "npcs", "npcs": NPCS_POR_MAPA.get(novo_mapa, [])})
                     transmitir_estado()
 
@@ -477,6 +616,7 @@ def tratar_cliente(conn, addr):
                             enviar(conn, resposta)
                             if resposta["sucesso"]:
                                 enviar(conn, info_inventario(info))
+                                bd.guardar_jogador(info)
 
                 elif tipo == "equipar":
                     item_id = msg.get("item_id")
@@ -492,6 +632,7 @@ def tratar_cliente(conn, addr):
                             else:
                                 info["arma_equipada"] = item_id
                             enviar(conn, info_inventario(info))
+                            bd.guardar_jogador(info)
 
                 elif tipo == "atacar":
                     monstro_id = msg.get("monstro_id")
@@ -514,7 +655,7 @@ def tratar_cliente(conn, addr):
                             info["ultimo_ataque"] = agora
                             arma = ARMAS.get(info["arma_equipada"])
                             dano_base = arma["dano"] if arma else DANO_PUNHOS
-                            dano = dano_base + bonus_dano_nivel(info)
+                            dano = dano_base + bonus_dano_nivel(info) + bonus_dano_habilidades(info)
                             monstro["vida"] -= dano
 
                             morreu = monstro["vida"] <= 0
@@ -551,6 +692,46 @@ def tratar_cliente(conn, addr):
                                 "subiu_nivel": subiu_nivel,
                                 "nivel": info["nivel"],
                             })
+                            if subiu_nivel:
+                                enviar(conn, info_habilidades(info))
+                            if morreu:
+                                # gravar aqui (e nao so no autosave/desligar)
+                                # para moedas/xp/missao nao se perderem
+                                # facilmente se o servidor cair.
+                                bd.guardar_jogador(info)
+                    transmitir_estado()
+
+                elif tipo == "desbloquear_habilidade":
+                    hab_id = msg.get("habilidade_id")
+                    with lock:
+                        info = jogadores.get(meu_id)
+                        if info is None:
+                            continue
+                        no = ARVORE_HABILIDADES.get(hab_id)
+                        resposta = {"tipo": "habilidade_resultado", "habilidade_id": hab_id}
+
+                        if no is None:
+                            resposta["sucesso"] = False
+                            resposta["mensagem"] = "Essa habilidade nao existe."
+                        elif hab_id in info["habilidades"]:
+                            resposta["sucesso"] = False
+                            resposta["mensagem"] = "Ja tens essa habilidade."
+                        elif any(req not in info["habilidades"] for req in no["requisitos"]):
+                            resposta["sucesso"] = False
+                            resposta["mensagem"] = "Falta desbloquear um requisito antes."
+                        elif info.get("pontos_habilidade", 0) < no["custo"]:
+                            resposta["sucesso"] = False
+                            resposta["mensagem"] = "Pontos de habilidade insuficientes."
+                        else:
+                            info["pontos_habilidade"] -= no["custo"]
+                            info["habilidades"].append(hab_id)
+                            resposta["sucesso"] = True
+                            resposta["mensagem"] = f"Desbloqueaste: {no['nome']}!"
+
+                        enviar(conn, resposta)
+                        if resposta["sucesso"]:
+                            enviar(conn, info_habilidades(info))
+                            bd.guardar_jogador(info)
                     transmitir_estado()
 
                 elif tipo == "consultar_missao":
@@ -568,26 +749,33 @@ def tratar_cliente(conn, addr):
                             "moedas": info["moedas"],
                         })
                         enviar(conn, info_inventario(info))
+                        bd.guardar_jogador(info)
                     transmitir_estado()
 
     except (ConnectionResetError, json.JSONDecodeError):
         pass
     finally:
         with lock:
-            jogadores.pop(meu_id, None)
+            info_final = jogadores.pop(meu_id, None)
+        if info_final is not None:
+            bd.guardar_jogador(info_final)
+            print(f"[-] Jogador {meu_id} ({info_final['nome']}) desligou-se (progresso guardado)")
         conn.close()
-        print(f"[-] Jogador {meu_id} desligou-se")
         transmitir_estado()
 
 
 def main():
+    bd.inicializar()
+
     servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     servidor.bind((HOST, PORT))
     servidor.listen()
     print(f"Servidor a correr em {HOST}:{PORT} (ctrl+C para parar)")
+    print(f"Base de dados dos jogadores: {bd.CAMINHO_BD}")
 
     threading.Thread(target=loop_monstros, daemon=True).start()
+    threading.Thread(target=loop_autosave, daemon=True).start()
 
     try:
         while True:
