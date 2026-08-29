@@ -26,7 +26,6 @@ import json
 import os
 import time
 import math
-import random
 
 import bd
 
@@ -365,6 +364,9 @@ jogadores = {}
 lock = threading.Lock()
 
 COMPRIMENTO_MAX_NOME = 16
+COMPRIMENTO_MIN_SENHA = 4
+COMPRIMENTO_MAX_CHAT = 140
+COOLDOWN_CHAT = 0.5         # segundos minimos entre mensagens de chat da mesma pessoa
 INTERVALO_AUTOSAVE = 20.0   # segundos entre gravacoes automaticas na base de dados
 
 
@@ -507,8 +509,20 @@ def tratar_cliente(conn, addr):
                         continue  # ja fez login, ignora tentativas repetidas
 
                     nome_pedido = (msg.get("nome") or "").strip()[:COMPRIMENTO_MAX_NOME]
+                    senha_pedida = msg.get("senha") or ""
+
                     if not nome_pedido:
-                        nome_pedido = f"Jogador{random.randint(1000, 9999)}"
+                        enviar(conn, {
+                            "tipo": "login_erro", "campo": "nome",
+                            "mensagem": "Escreve um nome de utilizador.",
+                        })
+                        continue
+                    if len(senha_pedida) < COMPRIMENTO_MIN_SENHA:
+                        enviar(conn, {
+                            "tipo": "login_erro", "campo": "senha",
+                            "mensagem": f"A password tem de ter pelo menos {COMPRIMENTO_MIN_SENHA} caracteres.",
+                        })
+                        continue
 
                     with lock:
                         ja_esta_a_jogar = any(
@@ -516,20 +530,28 @@ def tratar_cliente(conn, addr):
                         )
                         if ja_esta_a_jogar:
                             enviar(conn, {
-                                "tipo": "login_erro",
-                                "mensagem": f'Ja ha alguem a jogar como "{nome_pedido}". Escolhe outro nome.',
+                                "tipo": "login_erro", "campo": "nome",
+                                "mensagem": f'Ja ha alguem a jogar como "{nome_pedido}" agora mesmo.',
                             })
                             continue
 
-                        registo = bd.carregar_por_nome(nome_pedido)
-                        if registo is None:
-                            registo = bd.criar_jogador(
-                                nome_pedido, MOEDAS_INICIAIS, VIDA_INICIAL,
-                                ["espada_curta"], "espada_curta",
-                            )
-                            print(f"[+] Novo jogador registado: {registo['nome']} (id {registo['id']})")
+                        status, registo = bd.autenticar(
+                            nome_pedido, senha_pedida, MOEDAS_INICIAIS, VIDA_INICIAL,
+                            ["espada_curta"], "espada_curta",
+                        )
+
+                        if status == "senha_errada":
+                            enviar(conn, {
+                                "tipo": "login_erro", "campo": "senha",
+                                "mensagem": "Password incorreta para esse utilizador.",
+                            })
+                            continue
+
+                        conta_nova = (status == "novo")
+                        if conta_nova:
+                            print(f"[+] Nova conta registada: {registo['nome']} (id {registo['id']})")
                         else:
-                            print(f"[+] {registo['nome']} voltou a ligar-se (id {registo['id']})")
+                            print(f"[+] {registo['nome']} entrou (id {registo['id']})")
 
                         meu_id = registo["id"]
                         jogadores[meu_id] = {
@@ -543,6 +565,7 @@ def tratar_cliente(conn, addr):
                             "vida": registo["vida"], "vida_max": registo["vida_max"],
                             "ultimo_ataque": 0.0,
                             "ultimo_dano": 0.0,
+                            "ultimo_chat": 0.0,
                             "nivel": registo["nivel"],
                             "xp": registo["xp"],
                             "habilidades": registo["habilidades"],
@@ -557,7 +580,7 @@ def tratar_cliente(conn, addr):
                     print(f"[+] Jogador {meu_id} ({info_local['nome']}) ligou-se de {addr}")
 
                     enviar(conn, {
-                        "tipo": "bem_vindo", "id": meu_id, "nome": info_local["nome"],
+                        "tipo": "bem_vindo", "id": meu_id, "nome": info_local["nome"], "novo": conta_nova,
                         "moedas": info_local["moedas"], "vida": info_local["vida"], "vida_max": info_local["vida_max"],
                         "nivel": info_local["nivel"], "xp": info_local["xp"],
                         "xp_prox": xp_necessario(info_local["nivel"]),
@@ -751,6 +774,27 @@ def tratar_cliente(conn, addr):
                         enviar(conn, info_inventario(info))
                         bd.guardar_jogador(info)
                     transmitir_estado()
+
+                elif tipo == "chat":
+                    texto_chat = (msg.get("texto") or "").strip()[:COMPRIMENTO_MAX_CHAT]
+                    agora_chat = time.time()
+                    with lock:
+                        info = jogadores.get(meu_id)
+                        if info is None or not texto_chat:
+                            continue
+                        if (agora_chat - info.get("ultimo_chat", 0.0)) < COOLDOWN_CHAT:
+                            continue
+                        info["ultimo_chat"] = agora_chat
+                        # chat "local": so' quem esta no mesmo mapa ve a mensagem
+                        destinatarios = [j["conn"] for j in jogadores.values() if j["mapa"] == info["mapa"]]
+                        mensagem_chat = {
+                            "tipo": "chat_mensagem",
+                            "id": meu_id,
+                            "nome": info["nome"],
+                            "texto": texto_chat,
+                        }
+                    for c in destinatarios:
+                        enviar(c, mensagem_chat)
 
     except (ConnectionResetError, json.JSONDecodeError):
         pass
