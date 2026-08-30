@@ -417,6 +417,20 @@ def mensagem_sistema(conn, texto: str):
     })
 
 
+def enviar_teleporte(info):
+    """Avisa o cliente deste jogador que a sua posicao/mapa mudaram por
+    causa de um comando de staff (/tp, /ir, /trazer). Ao contrario do
+    movimento normal (onde e' o cliente que manda x/y), aqui e' o servidor
+    a empurrar a mudanca — por isso o cliente precisa de uma mensagem
+    propria ('teleporte') para saber que tem de trocar de mapa/fundo e
+    actualizar a sua posicao local, e nao so' esperar que ele proprio
+    detete um portal."""
+    enviar(info["conn"], {
+        "tipo": "teleporte", "mapa": info["mapa"], "x": info["x"], "y": info["y"],
+    })
+    enviar(info["conn"], {"tipo": "npcs", "npcs": NPCS_POR_MAPA.get(info["mapa"], [])})
+
+
 def processar_comando(info, conn, texto_comando):
     """Interpreta um comando de staff (ex: '/curar Fulano') e executa-o.
     So' e' chamado depois de confirmar que quem escreveu e' staff."""
@@ -525,7 +539,7 @@ def processar_comando(info, conn, texto_comando):
         mapa_destino = args[0]
         info["mapa"] = mapa_destino
         info["x"], info["y"] = MAPA_SPAWN[mapa_destino]
-        enviar(conn, {"tipo": "npcs", "npcs": NPCS_POR_MAPA.get(mapa_destino, [])})
+        enviar_teleporte(info)
         mensagem_sistema(conn, f"Teleportado para '{mapa_destino}'.")
         bd.guardar_jogador(info)
         return
@@ -538,11 +552,9 @@ def processar_comando(info, conn, texto_comando):
         if alvo is None:
             mensagem_sistema(conn, f"Nao encontrei o jogador '{args[0]}'.")
             return
-        mudou_mapa = info["mapa"] != alvo["mapa"]
         info["mapa"] = alvo["mapa"]
         info["x"], info["y"] = alvo["x"], alvo["y"]
-        if mudou_mapa:
-            enviar(conn, {"tipo": "npcs", "npcs": NPCS_POR_MAPA.get(alvo["mapa"], [])})
+        enviar_teleporte(info)
         mensagem_sistema(conn, f"Teleportado para junto de {alvo['nome']}.")
         return
 
@@ -554,11 +566,9 @@ def processar_comando(info, conn, texto_comando):
         if alvo is None:
             mensagem_sistema(conn, f"Nao encontrei o jogador '{args[0]}'.")
             return
-        mudou_mapa = alvo["mapa"] != info["mapa"]
         alvo["mapa"] = info["mapa"]
         alvo["x"], alvo["y"] = info["x"], info["y"]
-        if mudou_mapa:
-            enviar(alvo["conn"], {"tipo": "npcs", "npcs": NPCS_POR_MAPA.get(info["mapa"], [])})
+        enviar_teleporte(alvo)
         mensagem_sistema(conn, f"{alvo['nome']} foi teleportado ate ti.")
         mensagem_sistema(alvo["conn"], f"{info['nome']} teleportou-te ate ele/ela.")
         return
